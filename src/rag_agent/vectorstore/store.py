@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import chromadb
 from loguru import logger
 
 from rag_agent.agent.state import (
@@ -30,22 +31,6 @@ class VectorStoreManager:
     Manages the ChromaDB persistent vector store for the corpus.
 
     All corpus ingestion and retrieval operations pass through this class.
-    It is the single point of contact between the application and ChromaDB.
-
-    Parameters
-    ----------
-    settings : Settings, optional
-        Application settings. Uses get_settings() singleton if not provided.
-
-    Example
-    -------
-    >>> manager = VectorStoreManager()
-    >>> result = manager.ingest(chunks)
-    >>> print(f"Ingested: {result.ingested}, Skipped: {result.skipped}")
-    >>>
-    >>> chunks = manager.query("explain the vanishing gradient problem", k=4)
-    >>> for chunk in chunks:
-    ...     print(chunk.to_citation(), chunk.score)
     """
 
     def __init__(self, settings: Settings | None = None) -> None:
@@ -62,26 +47,32 @@ class VectorStoreManager:
     def _initialise(self) -> None:
         """
         Create or connect to the persistent ChromaDB client and collection.
-
-        Creates the chroma_db_path directory if it does not exist.
-        Uses PersistentClient so data survives between application restarts.
-
-        Called automatically during __init__. Should not be called directly.
-
-        Raises
-        ------
-        RuntimeError
-            If ChromaDB cannot be initialised at the configured path.
         """
-        # TODO: implement
-        # 1. Ensure Path(self._settings.chroma_db_path).mkdir(parents=True, exist_ok=True)
-        # 2. chromadb.PersistentClient(path=self._settings.chroma_db_path)
-        # 3. client.get_or_create_collection(
-        #        name=self._settings.chroma_collection_name,
-        #        metadata={"hnsw:space": "cosine"}   # cosine similarity
-        #    )
-        # 4. Log successful initialisation with collection name and item count
-        raise NotImplementedError
+
+        try:
+            db_path = Path(self._settings.chroma_db_path)
+            db_path.mkdir(parents=True, exist_ok=True)
+
+            self._client = chromadb.PersistentClient(
+                path=str(db_path)
+            )
+
+            self._collection = self._client.get_or_create_collection(
+                name=self._settings.chroma_collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+
+            logger.info(
+                "ChromaDB initialized: collection='{}', items={}",
+                self._settings.chroma_collection_name,
+                self._collection.count(),
+            )
+
+        except Exception as exc:
+            logger.exception("Failed to initialize ChromaDB")
+            raise RuntimeError(
+                f"Could not initialize ChromaDB: {exc}"
+            ) from exc
 
     # -----------------------------------------------------------------------
     # Duplicate Detection
@@ -91,48 +82,24 @@ class VectorStoreManager:
     def generate_chunk_id(source: str, chunk_text: str) -> str:
         """
         Generate a deterministic chunk ID from source filename and content.
-
-        Using a content hash ensures two uploads of the same file produce
-        the same IDs, making duplicate detection reliable regardless of
-        filename changes.
-
-        Parameters
-        ----------
-        source : str
-            The source filename (e.g. 'lstm.md').
-        chunk_text : str
-            The full text content of the chunk.
-
-        Returns
-        -------
-        str
-            A 16-character hex string derived from SHA-256 of the inputs.
         """
+
         content = f"{source}::{chunk_text}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     def check_duplicate(self, chunk_id: str) -> bool:
         """
-        Check whether a chunk with this ID already exists in the collection.
-
-        Parameters
-        ----------
-        chunk_id : str
-            The deterministic chunk ID to check.
-
-        Returns
-        -------
-        bool
-            True if the chunk already exists (duplicate). False otherwise.
-
-        Interview talking point: content-addressed deduplication is more
-        robust than filename-based deduplication because it detects identical
-        content even when files are renamed or re-uploaded.
+        Check whether a chunk with this ID already exists.
         """
-        # TODO: implement
-        # self._collection.get(ids=[chunk_id])
-        # Return True if the result contains the ID, False otherwise
-        raise NotImplementedError
+
+        if self._collection is None:
+            raise RuntimeError("ChromaDB collection is not initialized.")
+
+        result = self._collection.get(ids=[chunk_id])
+
+        ids = result.get("ids", [])
+
+        return chunk_id in ids
 
     # -----------------------------------------------------------------------
     # Ingestion
@@ -141,45 +108,116 @@ class VectorStoreManager:
     def ingest(self, chunks: list[DocumentChunk]) -> IngestionResult:
         """
         Embed and store a list of DocumentChunks in ChromaDB.
-
-        Checks each chunk for duplicates before embedding. Skips duplicates
-        silently and records the count in the returned IngestionResult.
-
-        Parameters
-        ----------
-        chunks : list[DocumentChunk]
-            Prepared chunks with text and metadata. Use DocumentChunker
-            to produce these from raw files.
-
-        Returns
-        -------
-        IngestionResult
-            Summary with counts of ingested, skipped, and errored chunks.
-
-        Notes
-        -----
-        Embeds in batches of 100 to avoid memory issues with large corpora.
-        Uses upsert (not add) so re-ingestion of modified content updates
-        existing chunks rather than raising an error.
-
-        Interview talking point: batch processing with a configurable
-        batch size is a production pattern that prevents OOM errors when
-        ingesting large document sets.
         """
-        # TODO: implement
-        # result = IngestionResult()
-        # For each chunk:
-        #   - check_duplicate(chunk.chunk_id) → if True, result.skipped += 1, continue
-        #   - embed chunk.chunk_text using self._embeddings.embed_documents([chunk.chunk_text])
-        #   - self._collection.upsert(
-        #         ids=[chunk.chunk_id],
-        #         embeddings=[embedding],
-        #         documents=[chunk.chunk_text],
-        #         metadatas=[chunk.metadata.to_dict()]
-        #     )
-        #   - result.ingested += 1
-        # Log summary and return result
-        raise NotImplementedError
+
+        result = IngestionResult()
+
+        if not chunks:
+            return result
+
+        if self._collection is None:
+            raise RuntimeError("ChromaDB collection is not initialized.")
+
+        new_chunks: list[DocumentChunk] = []
+
+        # Check for duplicates first
+        for chunk in chunks:
+            try:
+                if self.check_duplicate(chunk.chunk_id):
+                    result.skipped += 1
+                    logger.debug(
+                        "Skipping duplicate chunk: {}",
+                        chunk.chunk_id,
+                    )
+                    continue
+
+                new_chunks.append(chunk)
+
+            except Exception as exc:
+                error_message = (
+                    f"Duplicate check failed for "
+                    f"{chunk.chunk_id}: {exc}"
+                )
+                result.errors.append(error_message)
+                logger.error(error_message)
+
+        # Process new chunks in batches
+        batch_size = 100
+
+        for start in range(0, len(new_chunks), batch_size):
+            batch = new_chunks[start : start + batch_size]
+
+            try:
+                texts = [chunk.chunk_text for chunk in batch]
+
+                embeddings = self._embeddings.embed_documents(texts)
+
+                ids = [chunk.chunk_id for chunk in batch]
+
+                documents = [chunk.chunk_text for chunk in batch]
+
+                metadatas = [
+                    chunk.metadata.to_dict()
+                    for chunk in batch
+                ]
+
+                self._collection.upsert(
+                    ids=ids,
+                    embeddings=embeddings,
+                    documents=documents,
+                    metadatas=metadatas,
+                )
+
+                result.ingested += len(batch)
+
+                for chunk in batch:
+                    source = chunk.metadata.source
+                    if source not in result.document_ids:
+                        result.document_ids.append(source)
+
+            except Exception as exc:
+                logger.error(
+                    "Batch ingestion failed: {}",
+                    exc,
+                )
+
+                # Try chunks individually so one bad chunk does not
+                # prevent the remaining chunks from being ingested.
+                for chunk in batch:
+                    try:
+                        embedding = self._embeddings.embed_documents(
+                            [chunk.chunk_text]
+                        )[0]
+
+                        self._collection.upsert(
+                            ids=[chunk.chunk_id],
+                            embeddings=[embedding],
+                            documents=[chunk.chunk_text],
+                            metadatas=[chunk.metadata.to_dict()],
+                        )
+
+                        result.ingested += 1
+
+                        source = chunk.metadata.source
+                        if source not in result.document_ids:
+                            result.document_ids.append(source)
+
+                    except Exception as chunk_exc:
+                        error_message = (
+                            f"Failed to ingest chunk "
+                            f"{chunk.chunk_id}: {chunk_exc}"
+                        )
+                        result.errors.append(error_message)
+                        logger.error(error_message)
+
+        logger.info(
+            "Ingestion complete: ingested={}, skipped={}, errors={}",
+            result.ingested,
+            result.skipped,
+            len(result.errors),
+        )
+
+        return result
 
     # -----------------------------------------------------------------------
     # Retrieval
@@ -194,48 +232,86 @@ class VectorStoreManager:
     ) -> list[RetrievedChunk]:
         """
         Retrieve the top-k most relevant chunks for a query.
-
-        Applies similarity threshold filtering — chunks below
-        settings.similarity_threshold are excluded from results.
-
-        Parameters
-        ----------
-        query_text : str
-            The user query or rewritten query to retrieve against.
-        k : int, optional
-            Number of chunks to retrieve. Defaults to settings.retrieval_k.
-        topic_filter : str, optional
-            Restrict retrieval to a specific topic (e.g. 'LSTM').
-            Maps to ChromaDB where-filter on metadata.topic.
-        difficulty_filter : str, optional
-            Restrict retrieval to a difficulty level.
-            Maps to ChromaDB where-filter on metadata.difficulty.
-
-        Returns
-        -------
-        list[RetrievedChunk]
-            Chunks sorted by similarity score descending.
-            Empty list if no chunks meet the similarity threshold.
-
-        Interview talking point: returning an empty list (not hallucinating)
-        when no relevant context exists is the hallucination guard. This is
-        a critical production RAG pattern — the system must know what it
-        does not know.
         """
-        # TODO: implement
-        # k = k or self._settings.retrieval_k
-        # Build where_filter dict from topic_filter and difficulty_filter if provided
-        # Embed query_text using self._embeddings.embed_query(query_text)
-        # self._collection.query(
-        #     query_embeddings=[query_embedding],
-        #     n_results=k,
-        #     where=where_filter,      # None if no filters
-        #     include=["documents", "metadatas", "distances"]
-        # )
-        # Convert distances to similarity scores: score = 1 - distance (for cosine)
-        # Filter out chunks below self._settings.similarity_threshold
-        # Return list of RetrievedChunk objects sorted by score descending
-        raise NotImplementedError
+
+        if self._collection is None:
+            raise RuntimeError("ChromaDB collection is not initialized.")
+
+        k = k or self._settings.retrieval_k
+
+        if self._collection.count() == 0:
+            return []
+
+        query_embedding = self._embeddings.embed_query(query_text)
+
+        # Build ChromaDB metadata filter
+        conditions = []
+
+        if topic_filter:
+            conditions.append({"topic": topic_filter})
+
+        if difficulty_filter:
+            conditions.append({"difficulty": difficulty_filter})
+
+        if len(conditions) == 0:
+            where_filter = None
+        elif len(conditions) == 1:
+            where_filter = conditions[0]
+        else:
+            where_filter = {"$and": conditions}
+
+        query_kwargs = {
+            "query_embeddings": [query_embedding],
+            "n_results": min(k, self._collection.count()),
+            "include": [
+                "documents",
+                "metadatas",
+                "distances",
+            ],
+        }
+
+        if where_filter is not None:
+            query_kwargs["where"] = where_filter
+
+        results = self._collection.query(**query_kwargs)
+
+        ids = results.get("ids", [[]])[0]
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        retrieved: list[RetrievedChunk] = []
+
+        for chunk_id, document, metadata, distance in zip(
+            ids,
+            documents,
+            metadatas,
+            distances,
+        ):
+            # For cosine distance:
+            # similarity = 1 - distance
+            score = max(0.0, min(1.0, 1.0 - float(distance)))
+
+            if score < self._settings.similarity_threshold:
+                continue
+
+            chunk_metadata = ChunkMetadata.from_dict(metadata)
+
+            retrieved.append(
+                RetrievedChunk(
+                    chunk_id=chunk_id,
+                    chunk_text=document,
+                    metadata=chunk_metadata,
+                    score=score,
+                )
+            )
+
+        retrieved.sort(
+            key=lambda chunk: chunk.score,
+            reverse=True,
+        )
+
+        return retrieved
 
     # -----------------------------------------------------------------------
     # Corpus Inspection
@@ -244,71 +320,171 @@ class VectorStoreManager:
     def list_documents(self) -> list[dict]:
         """
         Return a list of all unique source documents in the collection.
-
-        Used by the UI to populate the document viewer panel.
-
-        Returns
-        -------
-        list[dict]
-            Each item contains: source (str), topic (str), chunk_count (int).
         """
-        # TODO: implement
-        # Query all metadata from the collection
-        # Group by metadata["source"] and count chunks per source
-        # Return sorted list of dicts
-        raise NotImplementedError
 
-    def get_document_chunks(self, source: str) -> list[DocumentChunk]:
+        if self._collection is None:
+            raise RuntimeError("ChromaDB collection is not initialized.")
+
+        if self._collection.count() == 0:
+            return []
+
+        results = self._collection.get(
+            include=["metadatas"]
+        )
+
+        metadatas = results.get("metadatas", [])
+
+        documents: dict[str, dict] = {}
+
+        for metadata in metadatas:
+            if not metadata:
+                continue
+
+            source = metadata.get("source", "")
+            topic = metadata.get("topic", "")
+
+            if source not in documents:
+                documents[source] = {
+                    "source": source,
+                    "topic": topic,
+                    "chunk_count": 0,
+                }
+
+            documents[source]["chunk_count"] += 1
+
+        return sorted(
+            documents.values(),
+            key=lambda item: item["source"].lower(),
+        )
+
+    def get_document_chunks(
+        self,
+        source: str,
+    ) -> list[DocumentChunk]:
         """
         Retrieve all chunks belonging to a specific source document.
-
-        Used by the document viewer to display document content.
-
-        Parameters
-        ----------
-        source : str
-            The source filename to retrieve chunks for.
-
-        Returns
-        -------
-        list[DocumentChunk]
-            All chunks from this source, ordered by their position
-            in the original document.
         """
-        # TODO: implement
-        # self._collection.get(where={"source": source}, include=["documents", "metadatas"])
-        # Reconstruct DocumentChunk objects from results
-        raise NotImplementedError
+
+        if self._collection is None:
+            raise RuntimeError("ChromaDB collection is not initialized.")
+
+        results = self._collection.get(
+            where={"source": source},
+            include=[
+                "documents",
+                "metadatas",
+            ],
+        )
+
+        ids = results.get("ids", [])
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+
+        chunks: list[DocumentChunk] = []
+
+        for chunk_id, document, metadata in zip(
+            ids,
+            documents,
+            metadatas,
+        ):
+            if not metadata or document is None:
+                continue
+
+            chunks.append(
+                DocumentChunk(
+                    chunk_id=chunk_id,
+                    chunk_text=document,
+                    metadata=ChunkMetadata.from_dict(metadata),
+                )
+            )
+
+        # ChromaDB does not have a guaranteed document position field
+        # in the current metadata model, so preserve returned order.
+        return chunks
 
     def get_collection_stats(self) -> dict:
         """
         Return summary statistics about the current collection.
-
-        Used by the UI to show corpus health at a glance.
-
-        Returns
-        -------
-        dict
-            Keys: total_chunks, topics (list), sources (list),
-            bonus_topics_present (bool).
         """
-        # TODO: implement
-        raise NotImplementedError
+
+        if self._collection is None:
+            raise RuntimeError("ChromaDB collection is not initialized.")
+
+        total_chunks = self._collection.count()
+
+        if total_chunks == 0:
+            return {
+                "total_chunks": 0,
+                "topics": [],
+                "sources": [],
+                "bonus_topics_present": False,
+            }
+
+        results = self._collection.get(
+            include=["metadatas"]
+        )
+
+        metadatas = results.get("metadatas", [])
+
+        topics = set()
+        sources = set()
+        bonus_topics_present = False
+
+        for metadata in metadatas:
+            if not metadata:
+                continue
+
+            topic = metadata.get("topic")
+            source = metadata.get("source")
+
+            if topic:
+                topics.add(topic)
+
+            if source:
+                sources.add(source)
+
+            is_bonus = str(
+                metadata.get("is_bonus", "false")
+            ).lower() == "true"
+
+            if is_bonus:
+                bonus_topics_present = True
+
+        return {
+            "total_chunks": total_chunks,
+            "topics": sorted(topics),
+            "sources": sorted(sources),
+            "bonus_topics_present": bonus_topics_present,
+        }
+
+    # -----------------------------------------------------------------------
+    # Document Deletion
+    # -----------------------------------------------------------------------
 
     def delete_document(self, source: str) -> int:
         """
         Remove all chunks from a specific source document.
-
-        Parameters
-        ----------
-        source : str
-            Source filename to remove.
-
-        Returns
-        -------
-        int
-            Number of chunks deleted.
         """
-        # TODO: implement
-        # self._collection.delete(where={"source": source})
-        raise NotImplementedError
+
+        if self._collection is None:
+            raise RuntimeError("ChromaDB collection is not initialized.")
+
+        existing = self._collection.get(
+            where={"source": source},
+            include=[],
+        )
+
+        ids = existing.get("ids", [])
+
+        if not ids:
+            return 0
+
+        self._collection.delete(ids=ids)
+
+        logger.info(
+            "Deleted {} chunks from source '{}'",
+            len(ids),
+            source,
+        )
+
+        return len(ids)

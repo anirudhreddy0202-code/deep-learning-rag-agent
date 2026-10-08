@@ -177,7 +177,11 @@ class RetrievedChunk:
 
         Example output: '[LSTM | intermediate | hochreiter1997.pdf]'
         """
-        return f"[{self.metadata.topic} | {self.metadata.difficulty} | {self.metadata.source}]"
+        return (
+            f"[{self.metadata.topic} | "
+            f"{self.metadata.difficulty} | "
+            f"{self.metadata.source}]"
+        )
 
 
 # ---------------------------------------------------------------------------
